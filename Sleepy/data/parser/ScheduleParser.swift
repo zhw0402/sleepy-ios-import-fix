@@ -75,6 +75,11 @@ enum ScheduleParser {
             if isLikelyCsv(trimmed) {
                 return try parseCsv(trimmed, defaultTableId, defaultColor)
             }
+            // 教务系统导出的「一行一门课 / 时间内嵌」CSV(浙江科技大学等教务导出形态):
+            // 星期/节次/周次不是独立列, 而是内嵌在「上课时间」单元格里 —— 上面的 parseCsv 认不了。
+            if isEduExportCsv(trimmed) {
+                return try parseEduExportCsv(trimmed, defaultTableId, defaultColor)
+            }
             return try parseSimpleText(trimmed, defaultTableId, defaultColor)
         }
     }
@@ -1135,6 +1140,179 @@ enum ScheduleParser {
             }
         }
         return courses
+    }
+
+    // MARK: - 教务系统导出 CSV(一行一门课 / 时间内嵌)
+
+    /// 判定是否为教务导出的「时间内嵌」CSV。
+    /// 特征: 表头同时含「课程名称」与「上课时间」(浙江科技大学等的教务处导出就是这种),
+    /// 星期/节次/周次全挤在「上课时间」一格里, 例如 "2-13周： 周四 3-5节"。
+    /// 这类文件过不了 isLikelyCsv(表头没有「星期/周次」列), 会掉进 parseSimpleText
+    /// 然后因为「半角逗号不是分隔符」被整行丢弃 → 报「未能解析任何课程」。
+    private static func isEduExportCsv(_ s: String) -> Bool {
+        guard s.filter({ $0 == "\n" }).count >= 1 else { return false }
+        guard let firstLine = s.split(separator: "\n").first.map(String.init) else { return false }
+        let h = firstLine.lowercased()
+        guard h.contains(",") else { return false }
+        let hasName = h.contains("课程名称") || h.contains("课程名")
+        let hasTime = h.contains("上课时间") || h.contains("上课节次")
+        return hasName && hasTime
+    }
+
+    /// 解析教务导出 CSV: 一行一门课, 时间/教室/教师内嵌。
+    /// 一个「上课时间」单元格可以含多段(用 ; 或换行分隔), 每段生成一条课程。
+    private static func parseEduExportCsv(_ text: String, _ defaultTableId: Int64, _ defaultColor: String) throws -> ParseResult {
+        let rows = parseCsvRows(text)
+        guard rows.count >= 2 else { throw ParseError("CSV 至少需要表头 + 1 行数据") }
+        let header = rows[0].map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+
+        func findCol(_ keys: String...) -> Int? {
+            for k in keys {
+                if let idx = header.firstIndex(where: { $0.contains(k.lowercased()) }) { return idx }
+            }
+            return nil
+        }
+
+        guard let nameIdx = findCol("课程名称", "课程名", "名称", "course", "name") else {
+            throw ParseError("找不到课程名列")
+        }
+        guard let timeIdx = findCol("上课时间", "上课节次", "时间") else {
+            throw ParseError("找不到上课时间列")
+        }
+        let teacherIdx = findCol("任课教师", "教师", "老师", "teacher")
+        let roomIdx = findCol("上课教室", "教室", "地点", "room", "position")
+
+        var courses: [CourseEntity] = []
+        var dropped: [String] = []
+
+        for i in 1..<rows.count {
+            let row = rows[i]
+
+            func cell(_ idx: Int?) -> String {
+                guard let idx = idx, idx >= 0, idx < row.count else { return "" }
+                return row[idx].trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            let name = cell(nameIdx)
+            if name.isEmpty { continue }
+
+            let timeCell = cell(timeIdx)
+            let sessions = parseEduTimeSessions(timeCell)
+            if sessions.isEmpty {
+                dropped.append(String((timeCell.isEmpty ? name : timeCell).prefix(40)))
+                continue
+            }
+
+            let teacher = normalizeTeacherList(cell(teacherIdx))
+            let room = normalizeRoomCell(cell(roomIdx))
+
+            for s in sessions {
+                courses.append(CourseEntity(
+                    groupId: "",
+                    tableId: defaultTableId,
+                    courseName: name,
+                    teacher: teacher,
+                    room: room,
+                    day: s.day,
+                    startNode: s.startNode,
+                    step: s.step,
+                    startWeek: s.startWeek,
+                    endWeek: s.endWeek,
+                    type: s.type,
+                    color: defaultColor,
+                    id: 0
+                ))
+            }
+        }
+
+        if courses.isEmpty { throw ParseError("未能解析任何课程") }
+
+        return ParseResult(
+            tableName: "导入的课表",
+            startDate: todayString(),
+            courses: courses,
+            droppedLines: dropped
+        )
+    }
+
+    private struct EduSession {
+        let day: Int
+        let startNode: Int
+        let step: Int
+        let startWeek: Int
+        let endWeek: Int
+        let type: Int
+    }
+
+    /// 解析「上课时间」单元格。支持:
+    ///   "1周： 周五 8-9节"
+    ///   "2-13周： 周四 3-5节"
+    ///   "1-16周(单)： 周一 1-2节"
+    ///   "2-5,7-9周： 周三 6-7节"、"3周： 周二 第5节"
+    /// 一段一格; 多段(; 分隔)会全部匹配出来。
+    private static func parseEduTimeSessions(_ cell: String) -> [EduSession] {
+        let raw = cell.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return [] }
+        // 分号统一(全角→半角), 便于周次列表切分
+        let normalized = raw.replacingOccurrences(of: "；", with: ";")
+        let pattern = "([0-9]{1,2}(?:\\s*[-~至]\\s*[0-9]{1,2})?(?:\\s*[,;]\\s*[0-9]{1,2}(?:\\s*[-~至]\\s*[0-9]{1,2})?)*)"
+            + "\\s*周\\s*(?:[（(]\\s*([单双])\\s*[)）])?\\s*[：:]?\\s*"
+            + "(周[一二三四五六日天]|星期[一二三四五六日天]|周[1-7])\\s*(?:第)?\\s*"
+            + "([0-9]{1,2})\\s*(?:[-~至]\\s*([0-9]{1,2}))?\\s*节"
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let ns = normalized as NSString
+        var out: [EduSession] = []
+        for m in re.matches(in: normalized, range: NSRange(location: 0, length: ns.length)) {
+            func g(_ i: Int) -> String? {
+                guard i < m.numberOfRanges, let r = Range(m.range(at: i), in: normalized) else { return nil }
+                return String(normalized[r])
+            }
+            guard let dayText = g(3), let day = parseDay(dayText),
+                  let startNode = g(4).flatMap({ Int($0.trimmingCharacters(in: .whitespaces)) }) else { continue }
+            let endNode = g(5).flatMap { Int($0.trimmingCharacters(in: .whitespaces)) } ?? startNode
+            let step = max(endNode - startNode + 1, 1)
+
+            let ranges = parseWeekRanges(g(1) ?? "")
+            let startWeek = ranges.map { min($0.0, $0.1) }.min() ?? 1
+            let endWeek = ranges.map { max($0.0, $0.1) }.max() ?? startWeek
+
+            let type: Int
+            switch g(2) {
+            case "单": type = 1
+            case "双": type = 2
+            default: type = 0
+            }
+
+            out.append(EduSession(day: day, startNode: startNode, step: step,
+                                  startWeek: startWeek, endWeek: endWeek, type: type))
+        }
+        return out
+    }
+
+    /// "陈亚轩101045" → "陈亚轩";  "武敏108020,叶耀军108005" → "武敏,叶耀军"
+    /// 教务导出的教师名后面常直接拼工号, 不去掉会在课表卡片上占满一行。
+    private static func normalizeTeacherList(_ raw: String) -> String {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.isEmpty { return "" }
+        let parts = t.split(whereSeparator: { ",，、/;；".contains($0) })
+            .map { stripTrailingDigits(String($0).trimmingCharacters(in: .whitespaces)) }
+            .filter { !$0.isEmpty }
+        return parts.isEmpty ? t : parts.joined(separator: ",")
+    }
+
+    /// 去掉中文字符后紧跟的数字(工号): "陈亚轩101045" → "陈亚轩"
+    private static func stripTrailingDigits(_ s: String) -> String {
+        var chars = Array(s)
+        while let last = chars.last, last.isNumber { chars.removeLast() }
+        let trimmed = String(chars).trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? s : trimmed
+    }
+
+    /// "A3-109(小和山校区)" → "A3-109" —— 括号里的校区信息每行都重复, 去掉更清爽
+    private static func normalizeRoomCell(_ raw: String) -> String {
+        let stripped = raw.replacingOccurrences(of: "[（(][^）)]*[）)]", with: "",
+                                                 options: .regularExpression)
+        return stripped.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - helpers
