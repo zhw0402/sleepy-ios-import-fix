@@ -1,0 +1,210 @@
+# Sleepy iOS — XcodeGen project definition
+# 移植自 sleepy Android (~/Desktop/sleepy), GPL-3.0
+name: Sleepy
+options:
+  bundleIdPrefix: com.lingion
+  # 6s Plus 真机 = iOS 15.8.8;16.0 装不上(2026-09 真机调试定版)
+  deploymentTarget:
+    iOS: "15.6"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.8"
+    # 真机调试走自动签名(Personal Team GU39QS224C);模拟器也兼容
+    # 无此设置 → "Ad Hoc code signing is not allowed with SDK 'iOS 16.4'"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: GU39QS224C
+    # Personal Team 免费证书,7 天过期,重连 Xcode 自动续
+    CODE_SIGN_IDENTITY: "Apple Development"
+    # xcodegen 不默认注入这批标准设置 — 缺 PRODUCT_NAME 产物名变空(.app/.appex 冲突)
+    PRODUCT_NAME: "$(TARGET_NAME)"
+    PRODUCT_BUNDLE_IDENTIFIER: "$(PRODUCT_BUNDLE_IDENTIFIER)"
+    CURRENT_PROJECT_VERSION: "61"
+    MARKETING_VERSION: "1.0.55"
+  configs:
+    Debug:
+      ONLY_ACTIVE_ARCH: YES
+      ENABLE_TESTABILITY: YES
+      # 真机装机只跑 Debug;Release(archive) 仍由 build-ipa.sh 走无签名管线
+      CODE_SIGN_STYLE: Automatic
+    Release:
+      ONLY_ACTIVE_ARCH: NO
+      CODE_SIGN_STYLE: Manual
+      CODE_SIGN_IDENTITY: "-"
+
+packages:
+  GRDB:
+    # ★ 2026-09-16 CI 修复: 原为作者自建镜像 gh.qdp.qzz.io, GitHub Actions runner 上不可达
+    url: https://github.com/groue/GRDB.swift.git
+    from: 6.29.3
+    # 仓库 2026 改名 GRDB→GRDB.swift;tag 带 v 前缀(v6.29.3)
+  SwiftSoup:
+    url: https://github.com/scinfu/SwiftSoup.git
+    exactVersion: 2.7.3
+    # ← Jsoup 的 Swift 移植,API 与 org.jsoup 1:1(JwQzParser/JwUrpParser 依赖)。
+    # 锁 2.7.3(tools 5.7): 最新 2.13.x 要求 Swift 6 工具链,Xcode 14.3 编不过。
+
+targets:
+  Sleepy:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sleepy
+        excludes: ["resources"]
+      - path: Sleepy/resources
+        # iOS 标准:lproj 目录直接作为 resources bundle 根(xcodegen 默认逐文件拷贝)
+        buildPhase: resources
+    dependencies:
+      - package: GRDB
+      - package: SwiftSoup
+      - target: SleepyWidget       # 内嵌 widget extension → PlugIns/SleepyWidget.appex
+    info:
+      path: Sleepy/Info.plist
+      properties:
+        CFBundleDisplayName: Sleepy 课程表
+        CFBundleShortVersionString: "1.0.43"
+        CFBundleVersion: "36"
+        UILaunchStoryboardName: LaunchScreen
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        # ★ widget 深链(widgetURL sleepy://open)+ 课程/导入深链(sleepy://course|import)
+        #   依赖 scheme 注册;缺此键 → simctl openurl 报 -10814,真机 widget 点击无响应
+        CFBundleURLTypes:
+          - CFBundleURLName: com.lingion.sleepy.ios
+            CFBundleURLSchemes: [sleepy]
+        # ★ 2026-09-16: 原来只声明 public.json → 「用 Sleepy 打开」只对 .json 出现,
+        #   CSV/ICS/TXT/HTML 在 Files 里根本没有 Sleepy 选项。这里补齐文本类 UTI。
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Schedule JSON
+            LSHandlerRank: Owner
+            LSItemContentTypes: ["public.json"]
+          - CFBundleTypeName: Schedule Text
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - public.text
+              - public.plain-text
+              - public.comma-separated-values-text
+              - public.html
+              - com.apple.ical.ics
+        LSSupportsOpeningDocumentsInPlace: false
+        # ★ 教务系统跳转链常混 http 中间页(校园网旧系统)。WKWebView 默认 ATS 拦 http,
+        #   表现为重定向链中途断掉。Android 原版 mixedContentMode=ALWAYS_ALLOW 等价意图:
+        #   只放开 WebView 内容 loads(NSAllowsArbitraryLoadsInWebContent 不影响 app 主 API)。
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoadsInWebContent: true
+        ITSAppUsesNonExemptEncryption: false
+    entitlements:
+      path: Sleepy/Sleepy.entitlements
+      # App Group 键已剥:免费 Personal Team 的 profile 装不下 group
+      # (门户 "not available"),带此键真机签名必失败。AppGroupResolver 回退沙箱。
+      # AltStore 侧载路径不受影响(重签时 AltStore 自己注入 group + ALTAppGroups)
+      properties: {}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lingion.sleepy.ios
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: "NO"
+
+  SleepyWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: SleepyWidget
+      # widget 与主 app 共享实现源(data/util/theme/widget — 实体/DAO/主题/渲染);
+      # extension 独立编译(不能链接主 app binary)。
+      # 排除: SleepyApp 入口 / Info.plist / ui 屏幕+组件(UIApplication 等 app-only API;
+      # widget 用不到屏层, 渲染逻辑已抽到 widget/ 与 util/)
+      - path: Sleepy
+        excludes: ["resources", "SleepyApp.swift", "Info.plist", "ui", "app"]
+      - path: Sleepy/resources
+        buildPhase: resources
+    dependencies:
+      - package: GRDB
+      - package: SwiftSoup
+    info:
+      path: SleepyWidget/Info.plist
+      properties:
+        CFBundleDisplayName: Sleepy Widget
+        CFBundleShortVersionString: "1.0.43"
+        CFBundleVersion: "36"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    entitlements:
+      path: SleepyWidget/SleepyWidget.entitlements
+      # 同主 app:剥 group(免费账号限制);AltStore 重签路径自会注入
+      properties: {}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lingion.sleepy.ios.widget
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: "NO"
+
+  SleepyTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: SleepyTests
+        excludes: ["resources"]
+      - path: SleepyTests/resources
+        buildPhase: resources
+        type: folder
+    dependencies:
+      - target: Sleepy
+    info:
+      path: SleepyTests/Info.plist
+      properties:
+        CFBundleIdentifier: com.lingion.sleepy.ios.tests
+        CFBundleName: SleepyTests
+        CFBundlePackageType: BNDL
+        CFBundleExecutable: "$(EXECUTABLE_NAME)"
+        CFBundleShortVersionString: "1.0.43"
+        CFBundleVersion: "36"
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lingion.sleepy.ios.tests
+        GENERATE_INFOPLIST_FILE: "NO"
+        # unit test 注入宿主 app 进程(xcodegen 2.38 不自动生成, 必须显式)
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Sleepy.app/Sleepy"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
+  SleepyUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: SleepyUITests
+    dependencies:
+      - target: Sleepy
+    entitlements:
+      path: SleepyUITests/SleepyUITests.entitlements
+      properties:
+        # runner 需要同组权限才能读 widget 写的 widget_archive.log
+        com.apple.security.application-groups: [group.com.lingion.sleepy.ios]
+    info:
+      path: SleepyUITests/Info.plist
+      properties:
+        CFBundleIdentifier: com.lingion.sleepy.ios.uitests
+        CFBundleName: SleepyUITests
+        CFBundlePackageType: BNDL
+        CFBundleExecutable: "$(EXECUTABLE_NAME)"
+        CFBundleShortVersionString: "1.0.43"
+        CFBundleVersion: "36"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lingion.sleepy.ios.uitests
+        GENERATE_INFOPLIST_FILE: "NO"
+
+schemes:
+  Sleepy:
+    build:
+      targets:
+        Sleepy: all
+    test:
+      targets:
+        - SleepyTests
+        - SleepyUITests

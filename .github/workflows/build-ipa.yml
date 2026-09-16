@@ -1,0 +1,69 @@
+name: build-ipa
+
+# 云端编译未签名 IPA(macOS runner + Xcode)。产物: Sleepy-unsigned.ipa(AltStore/SideStore 重签用)
+# 说明: 本仓库是 lingion/sleepy-ios 的本地化修复分支, 见 PATCHES.md
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Resolve SwiftPM packages
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project Sleepy.xcodeproj -scheme Sleepy
+
+      - name: Archive (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project Sleepy.xcodeproj \
+            -scheme Sleepy \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/Sleepy.xcarchive \
+            SWIFT_VERSION=5.0 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            | tail -80
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="build/Sleepy.xcarchive/Products/Applications/Sleepy.app"
+          test -d "$APP"
+          rm -rf build/Payload build/Sleepy-unsigned.ipa
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/
+          test -f build/Payload/Sleepy.app/PlugIns/SleepyWidget.appex/Info.plist
+          ( cd build && zip -qry Sleepy-unsigned.ipa Payload )
+          ls -l build/Sleepy-unsigned.ipa
+          shasum -a 256 build/Sleepy-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sleepy-unsigned-ipa
+          path: build/Sleepy-unsigned.ipa
+          if-no-files-found: error

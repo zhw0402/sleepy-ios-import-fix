@@ -1,0 +1,202 @@
+// WeekListWidgetView.swift — ← WeekListWidget.kt + WidgetBitmapRenderers.renderWeekList
+// 本周课表(列表) widget — 7 列日列(列数随 visibleDays)。
+// 列卡片: primaryContainer(今天) / surfaceContainer(其他), 14dp 圆角。
+// 课程: 彩色胶囊背景 + BOLD 课名。
+//
+// 对齐 Android 定稿语义 (2c937b11 / 895fe72f / ede839af):
+//  1. SMALL 档 = 最近 3 天「列脸」(renderWeekListCompact → 换列后走同一常规排版),
+//     不再是两行纯文本; 无课日不再残留日期胶囊;
+//  2. 每列 FIXED 窗口: availH = hDp − 58 − statusH, 行高 19 / 行距 0 / 页脚预留 19,
+//     截断时列底画「+N」(未截断不画,与 TwoDay 的「恒画」口径不同 —— 安卓即如此);
+//  3. 学期外顶部全宽状态行占位 16dp,同时从列可用高里扣掉。
+
+import SwiftUI
+import WidgetKit
+
+struct WeekListWidgetEntry: TimelineEntry {
+    let date: Date
+    let data: WeekData
+}
+
+struct WeekListWidgetProvider: TimelineProvider {
+    func placeholder(in context: Context) -> WeekListWidgetEntry {
+        WidgetArchiveLog.append(kind: "WeekListWidgetRV", family: context.family.description, result: "success")
+        return WeekListWidgetEntry(date: Date(), data: WeekListWidgetLoader.loadDataSync(kind: "WeekListWidgetRV"))
+    }
+
+    func getSnapshot(in context: Context, completion: @escaping (WeekListWidgetEntry) -> Void) {
+        WidgetArchiveLog.append(kind: "WeekListWidgetRV", family: context.family.description, result: "success")
+        completion(WeekListWidgetEntry(date: Date(), data: WeekListWidgetLoader.loadDataSync(kind: "WeekListWidgetRV")))
+    }
+
+    func getTimeline(in context: Context, completion: @escaping (Timeline<WeekListWidgetEntry>) -> Void) {
+        let entry = WeekListWidgetEntry(date: Date(), data: WeekListWidgetLoader.loadDataSync(kind: "WeekListWidgetRV"))
+        let refresh = Date().addingTimeInterval(6 * 3600)  // 半天兜底;数据变化由 App 端 reloadAllTimelines 触发
+        WidgetArchiveLog.append(kind: "WeekListWidgetRV", family: context.family.description, result: "success")
+        completion(Timeline(entries: [entry], policy: .after(refresh)))
+    }
+}
+
+// 星期标题(英缩写 — Android dayLabels arrayOf("", "Mon"...))
+let weekDayLabels = ["", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+/// 列数过滤(决策 D5-12, 对齐 renderWeekList L238-240): visibleDays 空集回退全周防御
+func shownDays(_ data: WeekData) -> [DayData] {
+    let visibleDays = AppPrefs.shared.getVisibleDays()
+    if visibleDays.isEmpty { return data.days }
+    return data.days.filter { visibleDays.contains($0.dayOfWeek) }.sorted { $0.dayOfWeek < $1.dayOfWeek }
+}
+
+// MARK: - View ← renderWeekList
+
+struct WeekListWidgetEntryView: View {
+    @Environment(\.widgetFamily) private var widgetFamily
+    @Environment(\.colorScheme) private var widgetColorScheme
+    let entry: WeekListWidgetEntry
+
+    var body: some View {
+        let data = entry.data
+        let isDark = effectiveWidgetIsDark(themeMode: data.themeMode, snapshotIsDark: entry.data.isDark, envScheme: widgetColorScheme)
+        let s = resolveWidgetScheme(themeKey: data.themeKey, isDark: isDark)
+        let colorless = AppPrefs.shared.isWidgetColorless()
+        // issue#26: widget 全局一档别名开关
+        let useAlias = AppPrefs.shared.isWidgetUseAlias()
+        let todayDow = DateUtils.todayDayOfWeek(today: Date())
+        // ← renderWeekList: SMALL 变体走 compact(最近 3 天列脸),其余档全量列
+        let isCompact = widgetFamily == .systemSmall
+        let days = isCompact ? WeekViewWidgetEntryView.compactDays(data: data, todayDow: todayDow)
+                             : shownDays(data)
+        let tier = WidgetLayoutTier(family: widgetFamily)
+        // 学期外状态行占位 16dp (← statusH)
+        let statusH: CGFloat = data.semesterStatus != .inRange ? 16 : 0
+
+        return GeometryReader { proxy in
+            let wins = (data.hasTable && !days.isEmpty && data.semesterStatus == .inRange)
+                ? WidgetWindows.weekList(days: days, heightDp: proxy.size.height, tier: tier,
+                                         statusH: statusH)
+                : nil
+            Group {
+                if !data.hasTable || days.isEmpty {
+                    Text(L10n.format("widget_create_schedule"))
+                        .font(.system(size: 15))
+                        .foregroundColor(s.onSurface)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                } else {
+                    VStack(spacing: 0) {
+                        // ★ 学期外: 顶部全宽状态行(学期前=第1周课照常预习 / 学期后=课程已清空)
+                        if data.semesterStatus != .inRange {
+                            Text(data.semesterStatus == .beforeStart
+                                 ? L10n.format("semester_not_started")
+                                 : L10n.format("semester_ended"))
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundColor(s.onSurfaceVariant)
+                                .frame(maxWidth: .infinity)
+                                .padding(.bottom, 4)
+                        }
+                        HStack(alignment: .top, spacing: 4) {
+                            ForEach(Array(days.enumerated()), id: \.element.dayOfWeek) { colIdx, day in
+                                WeekListDayColumn(day: day, scheme: s, colorless: colorless,
+                                                  isToday: day.dayOfWeek == todayDow, useAlias: useAlias,
+                                                  window: colIdx < (wins?.count ?? 0) ? wins?[colIdx] : nil)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(6)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(s.bg)
+        .widgetURL(URL(string: "sleepy://open"))
+    }
+}
+
+private struct WeekListDayColumn: View {
+    let day: DayData
+    let scheme: WidgetScheme
+    let colorless: Bool
+    let isToday: Bool
+    /// issue#26: widget 场景别名 — 课名展示名
+    let useAlias: Bool
+    /// 本列 FIXED 窗口;nil = 无窗口 (学期外/无课表 → 整列直排)
+    let window: WidgetWindowCore.WindowResult?
+
+    var body: some View {
+        let s = scheme
+        // 窗口只装得下前 N 门, 其余折成列底「+N」(← computeWeekListWindows)
+        let visible: [CourseEntity]
+        if let window = window {
+            visible = window.visible.flatMap { $0.row.courses }
+        } else {
+            visible = day.courses
+        }
+        let footerText: String? = window.flatMap { $0.footer ? "+\($0.hiddenAheadCourses)" : nil }
+
+        return VStack(alignment: .center, spacing: 0) {
+            // 星期标题
+            Text(weekDayLabels[day.dayOfWeek])
+                .font(.system(size: 12, weight: .bold))
+                .foregroundColor(isToday ? s.onPrimaryContainer : s.onSurface)
+                .padding(.top, 1)   // 安卓标题基线 colTop+12 (字形顶≈+4)
+                .padding(.bottom, 11) // chip 顶 colTop+26
+
+            if !day.courses.isEmpty {
+                // 课程数量 chip
+                Text("\(day.courses.count) 门")
+                    .font(.system(size: 9))
+                    .foregroundColor(s.onSurfaceVariant)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(s.surfaceVariant)
+                    .cornerRadius(50)
+                    .padding(.bottom, 6)
+
+                // 课程列表 — 每门课带颜色胶囊背景
+                VStack(spacing: 3) {
+                    ForEach(visible, id: \.id) { course in
+                        // ★ 课程颜色背景 (对齐 WeekGrid 风格) — 统一入口 CourseColorUtil (决策 D3)
+                        // issue#22: 同名课程多地点 — 用 day.courses 同 groupId 全行, 支持 AUTO/CUSTOM 按行判
+                        let bgColor = CourseColorUtil.pickCourseColorSwiftUIWithGroupRows(
+                            course, groupRows: day.courses.filter { $0.groupId == course.groupId },
+                            isDark: s.isDark, neutralColor: s.surfaceVariant, colorless: colorless)
+                        Text(CourseDisplayUtil.displayName(course, useAlias))
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundColor(CourseColorUtil.textColorOn(bg: bgColor, isDark: s.isDark,
+                                                                         onSurface: s.onSurface))
+                            .lineLimit(1)
+                            .padding(.horizontal, 2) // 文字距胶囊左/右 2dp (安卓 x+coursePad+2, 截断预算 colW-10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .frame(height: 16)
+                            .background(bgColor)
+                            .cornerRadius(4)
+                            .padding(.horizontal, 3) // 胶囊两侧内缩 3dp (安卓 x+3 ~ x+colW-3)
+                    }
+                    // 列底「+N」短页脚 (仅窗口真的截断时画 ← footerByCol)
+                    if let footerText = footerText {
+                        Text(footerText)
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundColor(s.onSurfaceVariant)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 19)
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        // 列背景: 今天 primaryContainer / 其他 surfaceContainer, 14dp 圆角
+        .background(isToday ? s.primaryContainer : s.surfaceContainer)
+        .cornerRadius(14)
+    }
+}
+
+struct WeekListWidget: Widget {
+    var body: some WidgetConfiguration {
+        StaticConfiguration(kind: "WeekListWidgetRV", provider: WeekListWidgetProvider()) { entry in
+            WeekListWidgetEntryView(entry: entry)
+        }
+        .configurationDisplayName(L10n.format("widget_week_list_label"))
+        .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
+    }
+}
