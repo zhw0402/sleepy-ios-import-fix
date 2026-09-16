@@ -92,7 +92,7 @@ enum TextFileReader {
         for cfEnc in [CFStringEncodings.GB_18030_2000,
                       CFStringEncodings.GB_2312_80,
                       CFStringEncodings.big5] {
-            let enc = nsEncoding(cfEnc.rawValue)
+            let enc = nsEncoding(CFStringEncoding(cfEnc.rawValue))
             if let s = String(data: data, encoding: enc) { return s }
         }
 
