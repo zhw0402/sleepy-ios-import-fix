@@ -1,7 +1,7 @@
 name: build-ipa
 
 # 云端编译未签名 IPA(macOS runner + Xcode)。产物: Sleepy-unsigned.ipa(AltStore/SideStore 重签用)
-# 说明: 本仓库是 lingion/sleepy-ios 的本地化修复分支, 见 PATCHES.md
+# 说明: 本仓库是 lingion/sleepy-ios 的修复分支, 见 PATCHES.md
 
 on:
   workflow_dispatch:
@@ -34,7 +34,7 @@ jobs:
 
       - name: Archive (unsigned)
         run: |
-          set -o pipefail
+          set +e
           xcodebuild archive \
             -project Sleepy.xcodeproj \
             -scheme Sleepy \
@@ -46,7 +46,24 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
-            | tail -80
+            > build/archive.log 2>&1
+          STATUS=$?
+          echo "=== xcodebuild exit: $STATUS ==="
+          echo "=== errors ==="
+          grep -nE "error:" build/archive.log | head -60
+          echo "=== error context ==="
+          grep -n -B3 -A12 "error:" build/archive.log | head -200
+          echo "=== tail ==="
+          tail -15 build/archive.log
+          exit $STATUS
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-log
+          path: build/archive.log
+          if-no-files-found: warn
 
       - name: Package unsigned IPA
         run: |
